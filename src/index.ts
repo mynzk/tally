@@ -1,5 +1,5 @@
 import {useState, useEffect, useRef} from "react";
-
+import {shallow} from "./shallow";
 export interface Schedule {
     schedule: () => () => unknown | void;
     dependencies: Set<Set<Schedule>>;
@@ -22,6 +22,7 @@ export function createSignal<T>(value: T): [() => T, SetterOrUpdater<SetValueTyp
 
     const read = (): T => {
         const schedule = context[context.length - 1];
+        console.log(context, "context");
         if (schedule) subscribe(schedule, subscriptions);
         return value;
     };
@@ -80,13 +81,14 @@ function flush(fn: () => void) {
 }
 
 type ReturnReaction = ReturnType<typeof createReaction>;
-type ReactionCall<T> = (signal: T) => void;
 
-export function useReaction<T>(fn: () => T): T {
-    const [, forceUpdate] = useState({});
+export function useReaction<T, S>(fn: () => T, selector: (state: T) => S): S {
+    const [state, setState] = useState<S>(() => selector(fn()));
     const [{track, reconcile}] = useState<ReturnReaction>(() => createReaction());
     const queue = useRef<number>(0);
     const mounted = useRef(false);
+    const currentState = useRef<S>(state);
+    currentState.current = state;
 
     useEffect(() => {
         if (mounted.current) return;
@@ -96,16 +98,17 @@ export function useReaction<T>(fn: () => T): T {
             queue.current === 1 &&
             flush(() => {
                 queue.current = 0;
-                forceUpdate({});
+                const preState = currentState.current;
+                const nextState = selector(fn());
+                if (!shallow(preState, nextState)) setState(nextState);
             });
         });
     }, []);
 
-    let rendering!: T;
     let exception;
     track(() => {
         try {
-            rendering = fn();
+            fn();
         } catch (e) {
             exception = e;
         }
@@ -115,42 +118,22 @@ export function useReaction<T>(fn: () => T): T {
         throw exception; // re-throw any exceptions caught during rendering
     }
 
-    return rendering;
-}
-
-export function useOnlyRun<T>(fn: () => T, reaction?: ReactionCall<T>): T {
-    const [{track, reconcile}] = useState<ReturnReaction>(() => createReaction());
-    const queue = useRef<number>(0);
-
-    useEffect(() => {
-        reconcile(() => {
-            queue.current += 1;
-            queue.current === 1 &&
-            flush(() => {
-                queue.current = 0;
-                reaction?.(fn());
-            });
-        });
-    });
-
-    let rendering!: T;
-    let exception;
-    track(() => {
-        try {
-            rendering = fn();
-        } catch (e) {
-            exception = e;
-        }
-    });
-
-    if (exception) {
-        throw exception; // re-throw any exceptions caught during rendering
-    }
-
-    return rendering;
+    return state;
 }
 
 export function useSignal<T>(signal: T): [() => T, SetterOrUpdater<SetValueType<T>>] {
     const [[read, write]] = useState(() => createSignal<T>(signal));
     return [read, write];
+}
+
+export function create<T>(initState: T) {
+    const [state, setState] = createSignal<T>(initState);
+    const useStore = <S>(selector: (state: T) => S) => useReaction(state, selector);
+
+    const dispatch = (nextState: Partial<T> | ((oldState: T) => Partial<T>)) => {
+        const newState = isFn(nextState) ? nextState(state()) : nextState;
+        setState(s => Object.assign({}, s, newState))
+    }
+
+    return {useStore, dispatch};
 }
