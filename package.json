@@ -1,6 +1,6 @@
 {
-  "name": "tally",
-  "version": "1.1.0",
+  "name": "@frada/tally",
+  "version": "1.1.1",
   "description": "Keep a tally of data reaction",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
