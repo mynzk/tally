@@ -8,8 +8,6 @@ npm install @frada/tally # or yarn add @frada/tally or pnpm add @frada/tally
 
 ## First create a store
 
-Your store is a hook! You can put anything in it: primitives, objects, functions. State has to be updated immutably and the `set` function [merges state](./docs/guides/immutable-state-and-merging.md) to help it.
-
 ```jsx
 import { create } from '@frada/tally'
 
