@@ -82,12 +82,13 @@ function flush(fn: () => void) {
 
 type ReturnReaction = ReturnType<typeof createReaction>;
 
-export function useReaction<T, S>(fn: () => T, selector: (state: T) => S): S {
-    const [state, setState] = useState<S>(() => selector(fn()));
+export function useReaction<T, S>(fn: () => T, selector?: (state: T) => S): S | T {
+    const selectorState = () => selector ? selector(fn()) : fn();
+    const [state, setState] = useState<S | T>(selectorState);
     const [{track, reconcile}] = useState<ReturnReaction>(() => createReaction());
     const queue = useRef<number>(0);
     const mounted = useRef(false);
-    const currentState = useRef<S>(state);
+    const currentState = useRef<S | T>(state);
     currentState.current = state;
 
     useEffect(() => {
@@ -99,7 +100,7 @@ export function useReaction<T, S>(fn: () => T, selector: (state: T) => S): S {
             flush(() => {
                 queue.current = 0;
                 const preState = currentState.current;
-                const nextState = selector(fn());
+                const nextState = selectorState();
                 if (!shallow(preState, nextState)) setState(nextState);
             });
         });
