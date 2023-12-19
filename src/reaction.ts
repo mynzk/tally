@@ -9,6 +9,9 @@ export interface Schedule {
 export const isFn = (x: any): x is Function => typeof x === "function";
 export type SetValueType<S> = S | ((prevValue: S) => S);
 export type SetterOrUpdater<T> = (value: T) => void;
+type ExtractState<S> = S extends () => infer T ? T: never;
+type Extract<S> = () => S;
+
 const context: any[] = [];
 
 function subscribe(schedule: Schedule, subscriptions: Set<Schedule>) {
@@ -16,12 +19,11 @@ function subscribe(schedule: Schedule, subscriptions: Set<Schedule>) {
     schedule.dependencies.add(subscriptions);
 }
 
-export function createSignal<T>(value: T): [() => T, SetterOrUpdater<SetValueType<T>>] {
+export function createSignal<T>(value: T): [Extract<T>, SetterOrUpdater<SetValueType<T>>] {
     const subscriptions = new Set<Schedule>();
 
     const read = (): T => {
         const schedule = context[context.length - 1];
-        console.log(context, "context");
         if (schedule) subscribe(schedule, subscriptions);
         return value;
     };
@@ -81,7 +83,11 @@ function flush(fn: () => void) {
 
 type ReturnReaction = ReturnType<typeof createReaction>;
 
-export function useReaction<T, S>(fn: () => T, selector = (state:T) => state as any): S {
+export function useReaction<T>(fn: Extract<T>):T;
+
+export function useReaction<T, S>(fn: Extract<T>, selector?: (state: ExtractState<Extract<T>>) => S): S;
+
+export function useReaction<T, S>(fn: Extract<T>, selector = (state: ExtractState<Extract<T>>) => state as any) {
     const [state, setState] = useState<S>(() => selector(fn()));
     const [{track, reconcile}] = useState<ReturnReaction>(() => createReaction());
     const queue = useRef<number>(0);
@@ -120,14 +126,14 @@ export function useReaction<T, S>(fn: () => T, selector = (state:T) => state as 
     return state;
 }
 
-export function useSignal<T>(signal: T): [() => T, SetterOrUpdater<SetValueType<T>>] {
+export function useSignal<T>(signal: T): [Extract<T>, SetterOrUpdater<SetValueType<T>>] {
     const [[read, write]] = useState(() => createSignal<T>(signal));
     return [read, write];
 }
 
 export function create<T>(initState: T) {
     const [state, setState] = createSignal<T>(initState);
-    const useStore = <S>(selector: (state: T) => S) => useReaction(state, selector);
+    const useStore = <S>(selector?: (state: ExtractState<Extract<T>>) => S) => useReaction(state, selector);
 
     const dispatch = (nextState: Partial<T> | ((oldState: T) => Partial<T>)) => {
         const newState = isFn(nextState) ? nextState(state()) : nextState;
