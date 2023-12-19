@@ -9,7 +9,6 @@ export interface Schedule {
 export const isFn = (x: any): x is Function => typeof x === "function";
 export type SetValueType<S> = S | ((prevValue: S) => S);
 export type SetterOrUpdater<T> = (value: T) => void;
-
 const context: any[] = [];
 
 function subscribe(schedule: Schedule, subscriptions: Set<Schedule>) {
@@ -82,13 +81,12 @@ function flush(fn: () => void) {
 
 type ReturnReaction = ReturnType<typeof createReaction>;
 
-export function useReaction<T, S>(fn: () => T, selector?: (state: T) => S): S | T {
-    const selectorState = () => selector ? selector(fn()) : fn();
-    const [state, setState] = useState<S | T>(selectorState);
+export function useReaction<T, S>(fn: () => T, selector = (state:T) => state as any): S {
+    const [state, setState] = useState<S>(() => selector(fn()));
     const [{track, reconcile}] = useState<ReturnReaction>(() => createReaction());
     const queue = useRef<number>(0);
     const mounted = useRef(false);
-    const currentState = useRef<S | T>(state);
+    const currentState = useRef<S>(state);
     currentState.current = state;
 
     useEffect(() => {
@@ -100,7 +98,7 @@ export function useReaction<T, S>(fn: () => T, selector?: (state: T) => S): S | 
             flush(() => {
                 queue.current = 0;
                 const preState = currentState.current;
-                const nextState = selectorState();
+                const nextState = selector(fn());
                 if (!shallow(preState, nextState)) setState(nextState);
             });
         });
