@@ -1,5 +1,4 @@
-import {useState, useEffect, useRef} from "react";
-import {shallow} from "./shallow";
+import {useState, useSyncExternalStore, useMemo} from "react";
 export interface Schedule {
     schedule: () => () => unknown | void;
     dependencies: Set<Set<Schedule>>;
@@ -71,16 +70,6 @@ export function createReaction() {
     return {track, reconcile};
 }
 
-function flush(fn: () => void) {
-    if (typeof MessageChannel !== "undefined") {
-        const {port1, port2} = new MessageChannel();
-        port1.onmessage = fn;
-        port2.postMessage(null);
-    } else {
-        setTimeout(fn);
-    }
-}
-
 type ReturnReaction = ReturnType<typeof createReaction>;
 
 export function useReaction<T>(fn: Extract<T>):T;
@@ -88,27 +77,22 @@ export function useReaction<T>(fn: Extract<T>):T;
 export function useReaction<T, S>(fn: Extract<T>, selector?: (state: ExtractState<Extract<T>>) => S): S;
 
 export function useReaction<T, S>(fn: Extract<T>, selector = (state: ExtractState<Extract<T>>) => state as any) {
-    const [state, setState] = useState<S>(() => selector(fn()));
-    const [{track, reconcile}] = useState<ReturnReaction>(() => createReaction());
-    const queue = useRef<number>(0);
-    const mounted = useRef(false);
-    const currentState = useRef<S>(state);
-    currentState.current = state;
-
-    useEffect(() => {
-        if (mounted.current) return;
-        mounted.current = true;
-        reconcile(() => {
-            queue.current += 1;
-            queue.current === 1 &&
-            flush(() => {
-                queue.current = 0;
-                const preState = currentState.current;
-                const nextState = selector(fn());
-                if (!shallow(preState, nextState)) setState(nextState);
-            });
-        });
+    const {subscribe, track} = useMemo(() => {
+        let scheduleUpdate: null | (() => void) = null;
+        const subscribe = (cb: () => void) => {
+            scheduleUpdate = cb;
+            return () => {
+                scheduleUpdate = null;
+            }
+        }
+        const {track, reconcile}: ReturnReaction = createReaction();
+        reconcile(() => scheduleUpdate?.());
+        return {subscribe, track};
     }, []);
+
+    const getState: Extract<S> = () => selector(fn());
+
+    const state = useSyncExternalStore(subscribe, getState, getState)
 
     let exception;
     track(() => {
