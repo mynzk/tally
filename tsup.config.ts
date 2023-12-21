@@ -6,7 +6,7 @@ export default defineConfig((opts) => ({
     entry: ['src/index.ts'],
     format: ['cjs', 'esm'],
     minify: !opts.watch,
-    sourcemap: true,
+    sourcemap: false,
     target: 'esnext',
     outDir: 'dist',
 }));
