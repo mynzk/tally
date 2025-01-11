@@ -117,7 +117,7 @@ export function useSignal<T>(signal: T): [Extract<T>, SetterOrUpdater<SetValueTy
 
 export function create<T>(initState: T) {
     const [state, setState] = createSignal<T>(initState);
-    const useStore = <S>(selector?: (state: ExtractState<Extract<T>>) => S) => useReaction(state, selector);
+    const useStore = <S = T>(selector?: (state: ExtractState<Extract<T>>) => S) => useReaction(state, selector);
 
     const dispatch = (nextState: Partial<T> | ((oldState: T) => Partial<T>)) => {
         const newState = isFn(nextState) ? nextState(state()) : nextState;
