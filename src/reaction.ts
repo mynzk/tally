@@ -1,128 +1,155 @@
-import {useState, useSyncExternalStore, useMemo} from "react";
+// signalStore.ts
+import { useState, useSyncExternalStore, useMemo } from "react";
+import { produce } from "immer"; // 🟢 引入 Immer 核心方法
+import { createScheduler } from "./scheduler";
+
+// ==================== 1. 类型定义 ====================
 export interface Schedule {
-    schedule: () => () => unknown | void;
-    dependencies: Set<Set<Schedule>>;
+  schedule: () => () => unknown | void;
+  dependencies: Set<Set<Schedule>>;
 }
+
+export type SetValueType<S> = S | ((prevValue: S) => S);
+export type SetterOrUpdater<T> = (value: T) => void;
+type Extract<T> = () => T;
 
 // eslint-disable-next-line @typescript-eslint/ban-types
 export const isFn = (x: any): x is Function => typeof x === "function";
-export type SetValueType<S> = S | ((prevValue: S) => S);
-export type SetterOrUpdater<T> = (value: T) => void;
-type ExtractState<S> = S extends () => infer T ? T: never;
-type Extract<S> = () => S;
 
-const context: any[] = [];
+// ==================== 2. 全局环境与批处理 ====================
+const context: Schedule[] = [];
+const batchQueue = new Set<() => void | unknown>();
+let isBatching = false;
 
-function subscribe(schedule: Schedule, subscriptions: Set<Schedule>) {
-    subscriptions.add(schedule);
-    schedule.dependencies.add(subscriptions);
+// 采用 MessageChannel 宏任务模型，优化大表单连续打字手感
+const runTaskAsync = createScheduler("channel");
+
+function flushQueue() {
+  const queue = Array.from(batchQueue);
+  batchQueue.clear();
+  isBatching = false;
+  for (const update of queue) {
+    update();
+  }
 }
+
+function subscribeDep(schedule: Schedule, subscriptions: Set<Schedule>) {
+  subscriptions.add(schedule);
+  schedule.dependencies.add(subscriptions);
+}
+
+function cleanup(reaction: Schedule) {
+  for (const dep of reaction.dependencies) {
+    dep.delete(reaction);
+  }
+  reaction.dependencies.clear();
+}
+
+// ==================== 3. 核心 API 实现 ====================
 
 export function createSignal<T>(value: T): [Extract<T>, SetterOrUpdater<SetValueType<T>>] {
-    const subscriptions = new Set<Schedule>();
+  const subscriptions = new Set<Schedule>();
 
-    const read = (): T => {
-        const schedule = context[context.length - 1];
-        if (schedule) subscribe(schedule, subscriptions);
-        return value;
-    };
+  const read = (): T => {
+    const schedule = context[context.length - 1];
+    if (schedule) subscribeDep(schedule, subscriptions);
+    return value;
+  };
 
-    const write = (nextValue: SetValueType<T>) => {
-        const newValue = isFn(nextValue) ? nextValue(value) : nextValue;
-        if (!Object.is(newValue, value)) {
-            value = newValue;
-            for (const sub of Array.from(subscriptions)) {
-                sub.schedule()?.();
-            }
-        }
-    };
-    return [read, write];
-}
-
-function cleanup(reaction: any) {
-    for (const dep of reaction.dependencies) {
-        dep.delete(reaction);
+  const write = (nextValue: SetValueType<T>) => {
+    const newValue = isFn(nextValue) ? nextValue(value) : nextValue;
+    if (!Object.is(newValue, value)) {
+      value = newValue;
+      for (const sub of Array.from(subscriptions)) {
+        const updateFn = sub.schedule();
+        if (updateFn) batchQueue.add(updateFn);
+      }
+      if (!isBatching && batchQueue.size > 0) {
+        isBatching = true;
+        runTaskAsync(flushQueue);
+      }
     }
-    reaction.dependencies.clear();
+  };
+  return [read, write];
 }
 
 export function createReaction() {
-    let schedule!: () => void | unknown;
-    const reaction = {
-        schedule: () => schedule,
-        dependencies: new Set<Set<Schedule>>(),
+  let scheduleUpdate!: () => void | unknown;
+  const reaction: Schedule = {
+    schedule: () => scheduleUpdate,
+    dependencies: new Set<Set<Schedule>>(),
+  };
+
+  function track<R>(fn: () => R): R {
+    cleanup(reaction);
+    context.push(reaction);
+    try {
+      return fn();
+      // eslint-disable-next-line no-useless-catch
+    } catch (e) {
+      throw e;
+    } finally {
+      context.pop();
+    }
+  }
+
+  function reconcile(fn: () => void | unknown) {
+    scheduleUpdate = fn;
+  }
+  return { track, reconcile, reaction };
+}
+
+export function useReaction<T, S = T>(fn: Extract<T>, selector?: (state: T) => S): S {
+  const activeSelector = selector || ((state: T) => state as unknown as S);
+
+  const { subscribe, getState } = useMemo(() => {
+    let updateCallback: (() => void) | null = null;
+    const { track, reconcile, reaction } = createReaction();
+
+    reconcile(() => updateCallback?.());
+
+    const subscribe = (cb: () => void) => {
+      updateCallback = cb;
+      return () => {
+        updateCallback = null;
+        cleanup(reaction);
+      };
     };
 
-    function track(fn: () => void) {
-        cleanup(reaction);
-        context.push(reaction);
-        try {
-            fn();
-        } finally {
-            context.pop();
-        }
-    }
+    const getState = () => {
+      return track(() => activeSelector(fn()));
+    };
 
-    function reconcile(fn: () => void | unknown) {
-        schedule = fn;
-    }
+    return { subscribe, getState };
+  }, [fn, activeSelector]);
 
-    return {track, reconcile};
+  return useSyncExternalStore(subscribe, getState, getState);
 }
 
-type ReturnReaction = ReturnType<typeof createReaction>;
-
-export function useReaction<T>(fn: Extract<T>):T;
-
-export function useReaction<T, S>(fn: Extract<T>, selector?: (state: ExtractState<Extract<T>>) => S): S;
-
-export function useReaction<T, S>(fn: Extract<T>, selector = (state: ExtractState<Extract<T>>) => state as any) {
-    const {subscribe, track} = useMemo(() => {
-        let scheduleUpdate: null | (() => void) = null;
-        const subscribe = (cb: () => void) => {
-            scheduleUpdate = cb;
-            return () => {
-                scheduleUpdate = null;
-            }
-        }
-        const {track, reconcile}: ReturnReaction = createReaction();
-        reconcile(() => scheduleUpdate?.());
-        return {subscribe, track};
-    }, []);
-
-    const getState: Extract<S> = () => selector(fn());
-
-    const state = useSyncExternalStore(subscribe, getState, getState)
-
-    let exception;
-    track(() => {
-        try {
-            fn();
-        } catch (e) {
-            exception = e;
-        }
-    });
-
-    if (exception) {
-        throw exception; // re-throw any exceptions caught during rendering
-    }
-
-    return state;
+export function useSignal<T>(initialValue: T): [Extract<T>, SetterOrUpdater<SetValueType<T>>] {
+  const [signal] = useState(() => createSignal<T>(initialValue));
+  return signal;
 }
 
-export function useSignal<T>(signal: T): [Extract<T>, SetterOrUpdater<SetValueType<T>>] {
-    const [[read, write]] = useState(() => createSignal<T>(signal));
-    return [read, write];
-}
+/**
+ * 🟢 满血版：整合 Immer 的 Store 创建器
+ */
+export function create<T extends object>(initState: T) {
+  const [state, setState] = createSignal<T>(initState);
 
-export function create<T>(initState: T) {
-    const [state, setState] = createSignal<T>(initState);
-    const useStore = <S = T>(selector?: (state: ExtractState<Extract<T>>) => S) => useReaction(state, selector);
+  const useStore = <S = T>(selector?: (state: T) => S) => useReaction(state, selector);
 
-    const dispatch = (nextState: Partial<T> | ((oldState: T) => Partial<T>)) => {
-        const newState = isFn(nextState) ? nextState(state()) : nextState;
-        setState(s => Object.assign({}, s, newState))
-    }
+  /**
+   * 升级后的 dispatch
+   * 接收一个 Immer 的 recipe 纯函数 (draft => void)
+   * 允许通过直接修改草稿对象的语法，安全生成全新的不可变状态快照
+   */
+  const dispatch = (recipe: (draft: T) => void | T) => {
+    const oldState = state();
+    // 使用 immer 生成深度更新后的全新 immutable 对象
+    const nextState = produce(oldState, recipe);
+    setState(nextState);
+  };
 
-    return {useStore, dispatch};
+  return { useStore, dispatch, getState: state };
 }
