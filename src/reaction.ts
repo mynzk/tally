@@ -1,43 +1,90 @@
-import { useState, useSyncExternalStore, useMemo, useRef } from "react";
-import { produce, Draft } from "immer";
+import { useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { produce, type Producer } from "immer";
 import { createScheduler } from "./scheduler";
 
-// ==================== 1. 类型定义 ====================
 export type DepSet = Set<Schedule>;
 
 export interface Schedule {
-  schedule: () => () => unknown | void;
+  schedule: () => void | unknown;
   dependencies: Set<DepSet>;
+  disposed: boolean;
 }
 
 export type SetValueType<S> = S | ((prevValue: S) => S);
 export type SetterOrUpdater<T> = (value: T) => void;
 type Extract<T> = () => T;
+type Selector<T, S> = (state: T) => S;
+type StoreUpdater<T extends object> = Partial<T> | T | Producer<T>;
 
-export const isFn = (x: any): x is Function => typeof x === "function";
+const identitySelector = <T, S = T>(state: T) => state as unknown as S;
+const noop = () => undefined;
 
-// ==================== 2. 全局环境与批处理 ====================
-const context: Schedule[] = [];
-const batchQueue = new Set<() => void | unknown>();
-let isBatching = false;
+// eslint-disable-next-line @typescript-eslint/ban-types
+export const isFn = (x: unknown): x is Function => typeof x === "function";
+
+const reactionStack: Schedule[] = [];
+const pendingReactions = new Set<Schedule>();
+let isFlushScheduled = false;
+let globalVersion = 0;
 
 const runTaskAsync = createScheduler("channel");
 
-function flushQueue() {
-  isBatching = false;
-  // ⚡ 优化：标准 while 队列消费，防止执行任务时向队列追加新任务导致遗漏
-  while (batchQueue.size > 0) {
-    const queue = Array.from(batchQueue);
-    batchQueue.clear();
-    for (const update of queue) {
-      update();
+function getCurrentReaction() {
+  return reactionStack[reactionStack.length - 1];
+}
+
+function bumpVersion() {
+  globalVersion += 1;
+}
+
+function flushReactions() {
+  try {
+    while (pendingReactions.size > 0) {
+      const queue = Array.from(pendingReactions);
+      pendingReactions.clear();
+
+      for (const reaction of queue) {
+        if (!reaction.disposed) {
+          reaction.schedule();
+        }
+      }
+    }
+  } finally {
+    isFlushScheduled = false;
+
+    if (pendingReactions.size > 0) {
+      scheduleFlush();
     }
   }
 }
 
-function subscribeDep(schedule: Schedule, subscriptions: Set<Schedule>) {
-  subscriptions.add(schedule);
-  schedule.dependencies.add(subscriptions);
+function scheduleFlush() {
+  if (isFlushScheduled) return;
+  isFlushScheduled = true;
+  runTaskAsync(flushReactions);
+}
+
+function enqueueReaction(reaction: Schedule) {
+  if (reaction.disposed) return;
+  pendingReactions.add(reaction);
+  scheduleFlush();
+}
+
+function runWithoutTracking<T>(fn: () => T): T {
+  const previousStack = reactionStack.splice(0, reactionStack.length);
+
+  try {
+    return fn();
+  } finally {
+    reactionStack.push(...previousStack);
+  }
+}
+
+function subscribeDep(reaction: Schedule, subscriptions: DepSet) {
+  if (reaction.disposed || subscriptions.has(reaction)) return;
+
+  subscriptions.add(reaction);
+  reaction.dependencies.add(subscriptions);
 }
 
 function cleanup(reaction: Schedule) {
@@ -47,122 +94,132 @@ function cleanup(reaction: Schedule) {
   reaction.dependencies.clear();
 }
 
-// ==================== 3. 核心 API 实现 ====================
-
 export function createSignal<T>(initialValue: T): [Extract<T>, SetterOrUpdater<SetValueType<T>>] {
-  let value = initialValue; // 🟢 修正：这里原代码是直接改形参，闭包直接引用局部变量更稳固
+  let value = initialValue;
   const subscriptions = new Set<Schedule>();
 
   const read = (): T => {
-    const schedule = context[context.length - 1];
-    if (schedule) subscribeDep(schedule, subscriptions);
+    const reaction = getCurrentReaction();
+    if (reaction) subscribeDep(reaction, subscriptions);
+
     return value;
   };
 
   const write = (nextValue: SetValueType<T>) => {
-    // ⚡ 优化：计算新值时短暂清空上下文，防止函数体内读 Signal 造成依赖污染
-    const tempContext = [...context];
-    context.length = 0;
-    const newValue = isFn(nextValue) ? nextValue(value) : nextValue;
-    context.push(...tempContext);
+    const newValue = runWithoutTracking(() => (isFn(nextValue) ? nextValue(value) : nextValue));
 
-    if (!Object.is(newValue, value)) {
-      value = newValue;
-      // 变动时，同步将所有订阅者推入批处理队列
-      for (const sub of Array.from(subscriptions)) {
-        const updateFn = sub.schedule();
-        if (updateFn) batchQueue.add(updateFn);
-      }
-      if (!isBatching && batchQueue.size > 0) {
-        isBatching = true;
-        runTaskAsync(flushQueue);
-      }
+    if (Object.is(newValue, value)) return;
+
+    value = newValue;
+    bumpVersion();
+
+    for (const reaction of Array.from(subscriptions)) {
+      enqueueReaction(reaction);
     }
   };
+
   return [read, write];
 }
 
 export function createReaction() {
-  let scheduleUpdate: (() => void | unknown) | null = null;
-  
+  let scheduleUpdate: (() => void | unknown) = noop;
+
   const reaction: Schedule = {
-    schedule: () => scheduleUpdate ?? (() => {}),
+    schedule: () => scheduleUpdate(),
     dependencies: new Set<DepSet>(),
+    disposed: false,
   };
 
   function track<R>(fn: () => R): R {
+    if (reaction.disposed) {
+      return fn();
+    }
+
     cleanup(reaction);
-    context.push(reaction);
+    reactionStack.push(reaction);
+
     try {
       return fn();
-    } catch (e) {
-      cleanup(reaction);
-      throw e;
     } finally {
-      context.pop();
+      reactionStack.pop();
     }
   }
 
   function reconcile(fn: () => void | unknown) {
+    if (reaction.disposed) return;
     scheduleUpdate = fn;
   }
 
   function dispose() {
+    if (reaction.disposed) return;
+
+    reaction.disposed = true;
+    scheduleUpdate = noop;
+    pendingReactions.delete(reaction);
     cleanup(reaction);
-    scheduleUpdate = null;
   }
 
   return { track, reconcile, reaction, dispose };
 }
 
-export function useReaction<T, S = T>(fn: Extract<T>, selector?: (state: T) => S): S {
-  const defaultSelector = (state: T) => state as unknown as S;
-  const activeSelector = selector || defaultSelector;
-
+export function useReaction<T, S = T>(fn: Extract<T>, selector?: Selector<T, S>): S {
   const latestFn = useRef(fn);
-  const latestSelector = useRef(activeSelector);
+  const latestSelector = useRef<Selector<T, S>>(selector ?? identitySelector);
   latestFn.current = fn;
-  latestSelector.current = activeSelector;
+  latestSelector.current = selector ?? identitySelector;
 
-  // ⚡ 优化：核心缓存结构，严格遵守 useSyncExternalStore 规范
   const storeMemo = useMemo(() => {
     const { track, reconcile, reaction } = createReaction();
-    
-    // 缓存上一次切片数据
-    let lastSelectedState: S;
-    let isInitialized = false;
 
-    const runTrack = () => {
-      return track(() => latestSelector.current(latestFn.current()));
+    let snapshot: S;
+    let snapshotVersion = -1;
+    let snapshotFn = latestFn.current;
+    let snapshotSelector = latestSelector.current;
+    let hasSnapshot = false;
+
+    const readSelected = () => track(() => latestSelector.current(latestFn.current()));
+
+    const updateSnapshot = () => {
+      const nextSnapshot = readSelected();
+      const changed = !hasSnapshot || !Object.is(snapshot, nextSnapshot);
+
+      snapshot = nextSnapshot;
+      snapshotVersion = globalVersion;
+      snapshotFn = latestFn.current;
+      snapshotSelector = latestSelector.current;
+      hasSnapshot = true;
+
+      return changed;
     };
 
     const subscribe = (cb: () => void) => {
-      // 当底层 Signal 通知改变时，触发 track 重新收集依赖，并运行 React 更新
       reconcile(() => {
-        const nextState = runTrack();
-        if (!Object.is(lastSelectedState, nextState)) {
-          lastSelectedState = nextState;
-          cb(); // 真正通知 React 更新
+        if (updateSnapshot()) {
+          cb();
         }
       });
+
       return () => {
+        pendingReactions.delete(reaction);
         cleanup(reaction);
       };
     };
 
-    const getState = () => {
-      // 初始化执行第一次依赖收集
-      if (!isInitialized) {
-        lastSelectedState = runTrack();
-        isInitialized = true;
+    const getSnapshot = () => {
+      const inputsChanged =
+        snapshotFn !== latestFn.current || snapshotSelector !== latestSelector.current;
+
+      if (!hasSnapshot || snapshotVersion !== globalVersion || inputsChanged) {
+        updateSnapshot();
       }
-      return lastSelectedState;
+
+      return snapshot;
     };
 
-    return { subscribe, getState };
+    return { subscribe, getSnapshot };
   }, []);
 
-  return useSyncExternalStore(storeMemo.subscribe, storeMemo.getState, storeMemo.getState);
+  return useSyncExternalStore(storeMemo.subscribe, storeMemo.getSnapshot, storeMemo.getSnapshot);
 }
 
 export function useSignal<T>(initialValue: T): [Extract<T>, SetterOrUpdater<SetValueType<T>>] {
@@ -173,12 +230,16 @@ export function useSignal<T>(initialValue: T): [Extract<T>, SetterOrUpdater<SetV
 export function create<T extends object>(initState: T) {
   const [state, setState] = createSignal<T>(initState);
 
-  const useStore = <S = T>(selector?: (state: T) => S) => useReaction(state, selector);
+  const useStore = <S = T>(selector?: Selector<T, S>) => useReaction(state, selector);
 
-  const dispatch = (recipe: (draft: Draft<T>) => void | T) => {
-    const oldState = state();
-    const nextState = produce(oldState, recipe);
-    setState(nextState as T);
+  const dispatch = (updater: StoreUpdater<T>) => {
+    if (isFn(updater)) {
+      const nextState = produce(state(), updater);
+      setState(nextState as T);
+      return;
+    }
+
+    setState((prevState) => ({ ...prevState, ...updater }));
   };
 
   return { useStore, dispatch, getState: state };
