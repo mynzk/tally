@@ -1,6 +1,6 @@
 {
   "name": "@frada/tally",
-  "version": "1.2.12",
+  "version": "2.0.0",
   "description": "Keep a tally of data reaction",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -9,7 +9,11 @@
     "preinstall": "npx only-allow pnpm",
     "lint": "eslint src",
     "build": "tsup",
-    "dev": "tsup --watch"
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "tsup bench/index.ts --format esm --no-dts --silent --out-dir .bench-out --target node18 && node .bench-out/index.mjs",
+    "prepublishOnly": "pnpm lint && pnpm tsc --noEmit && pnpm test && pnpm build"
   },
   "repository": {
     "type": "git",
@@ -43,6 +47,7 @@
     "eslint-plugin-react": "7.32.2",
     "eslint-plugin-react-hooks": "4.6.0",
     "immer": "^11.1.8",
+    "jsdom": "^29.1.1",
     "prettier": "^2.8.7",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",

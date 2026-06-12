@@ -6,3 +6,4 @@ lib/
 coverage/
 types/
 .DS_Store
+.bench-out/

@@ -17,5 +17,6 @@
     "jsx": "react",
     "esModuleInterop": true
   },
-  "include": ["src", "tsup.config.ts", "setupTests.ts", "vitest.config.ts"]
+  "include": ["src", "tsup.config.ts", "vitest.config.ts"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.spec.ts", "bench"]
 }

@@ -1,9 +1,13 @@
 // scheduler.ts
 
+export type SchedulerType = "promise" | "channel" | "microtask";
+
+export type ScheduleFn = (flush: () => void) => void;
+
 /**
  * 创建不同引擎的批处理触发器
  */
-export function createScheduler(type: "promise" | "channel" | "microtask" = "channel") {
+export function createScheduler(type: SchedulerType = "channel"): ScheduleFn {
   if (type === "channel") {
     // MessageChannel 方案（宏任务，高频、繁重计算表单首选，防止输入卡顿）
     const channel = new MessageChannel();
