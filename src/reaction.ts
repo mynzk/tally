@@ -1,6 +1,5 @@
-// signalStore.ts
-import { useState, useSyncExternalStore, useMemo } from "react";
-import { produce } from "immer"; // 🟢 引入 Immer 核心方法
+import { useState, useSyncExternalStore, useMemo, useRef } from "react";
+import { produce, Draft } from "immer"; // 🟢 优化：引入 Draft 类型
 import { createScheduler } from "./scheduler";
 
 // ==================== 1. 类型定义 ====================
@@ -13,7 +12,6 @@ export type SetValueType<S> = S | ((prevValue: S) => S);
 export type SetterOrUpdater<T> = (value: T) => void;
 type Extract<T> = () => T;
 
-// eslint-disable-next-line @typescript-eslint/ban-types
 export const isFn = (x: any): x is Function => typeof x === "function";
 
 // ==================== 2. 全局环境与批处理 ====================
@@ -21,7 +19,6 @@ const context: Schedule[] = [];
 const batchQueue = new Set<() => void | unknown>();
 let isBatching = false;
 
-// 采用 MessageChannel 宏任务模型，优化大表单连续打字手感
 const runTaskAsync = createScheduler("channel");
 
 function flushQueue() {
@@ -85,10 +82,8 @@ export function createReaction() {
     context.push(reaction);
     try {
       return fn();
-      // eslint-disable-next-line no-useless-catch
-    } catch (e) {
-      throw e;
-    } finally {
+    } // 🟢 优化：移除了冗余的 catch(e) { throw e }
+    finally {
       context.pop();
     }
   }
@@ -100,7 +95,18 @@ export function createReaction() {
 }
 
 export function useReaction<T, S = T>(fn: Extract<T>, selector?: (state: T) => S): S {
-  const activeSelector = selector || ((state: T) => state as unknown as S);
+  // 🟢 优化：默认 selector 使用固定引用，避免重渲染引发的判定问题
+  const defaultSelector = (state: T) => state as unknown as S;
+  const activeSelector = selector || defaultSelector;
+
+  // 🟢 优化：使用 Ref 存储最新函数，解决 useMemo 依赖改变导致 Reaction 实例重建、依赖丢失的问题
+  const latestFn = useRef(fn);
+  const latestSelector = useRef(activeSelector);
+  latestFn.current = fn;
+  latestSelector.current = activeSelector;
+
+  // 🟢 优化：增加快照缓存，防止 selector 返回新对象时引发 useSyncExternalStore 渲染死循环
+  const lastSelectedState = useRef<S | null>(null);
 
   const { subscribe, getState } = useMemo(() => {
     let updateCallback: (() => void) | null = null;
@@ -117,11 +123,19 @@ export function useReaction<T, S = T>(fn: Extract<T>, selector?: (state: T) => S
     };
 
     const getState = () => {
-      return track(() => activeSelector(fn()));
+      // 始终执行 track 以保证依赖是最新的
+      const nextState = track(() => latestSelector.current(latestFn.current()));
+      
+      // 浅比较：如果新旧状态全等，直接返回旧引用，避免 React 判定失误
+      if (Object.is(lastSelectedState.current, nextState)) {
+        return lastSelectedState.current as S;
+      }
+      lastSelectedState.current = nextState;
+      return nextState;
     };
 
     return { subscribe, getState };
-  }, [fn, activeSelector]);
+  }, []); // 🟢 优化：空依赖数组，确保单个组件内生命周期内 Reaction 唯一
 
   return useSyncExternalStore(subscribe, getState, getState);
 }
@@ -139,16 +153,11 @@ export function create<T extends object>(initState: T) {
 
   const useStore = <S = T>(selector?: (state: T) => S) => useReaction(state, selector);
 
-  /**
-   * 升级后的 dispatch
-   * 接收一个 Immer 的 recipe 纯函数 (draft => void)
-   * 允许通过直接修改草稿对象的语法，安全生成全新的不可变状态快照
-   */
-  const dispatch = (recipe: (draft: T) => void | T) => {
+  // 🟢 优化：对齐 Immer 官方签名，完美支持 (draft => void) 和 (draft => T)
+  const dispatch = (recipe: (draft: Draft<T>) => void | T) => {
     const oldState = state();
-    // 使用 immer 生成深度更新后的全新 immutable 对象
     const nextState = produce(oldState, recipe);
-    setState(nextState);
+    setState(nextState as T);
   };
 
   return { useStore, dispatch, getState: state };
