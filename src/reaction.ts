@@ -3,9 +3,12 @@ import { produce, Draft } from "immer"; // 🟢 优化：引入 Draft 类型
 import { createScheduler } from "./scheduler";
 
 // ==================== 1. 类型定义 ====================
+// 🟢 优化：重新定义更清晰的类型别名
+export type DepSet = Set<Schedule>; // 代表 Signal 内部的订阅者集合
+
 export interface Schedule {
   schedule: () => () => unknown | void;
-  dependencies: Set<Set<Schedule>>;
+  dependencies: Set<DepSet>; // 收集自己订阅了哪些 Signal 的 DepSet
 }
 
 export type SetValueType<S> = S | ((prevValue: S) => S);
@@ -71,10 +74,11 @@ export function createSignal<T>(value: T): [Extract<T>, SetterOrUpdater<SetValue
 }
 
 export function createReaction() {
-  let scheduleUpdate!: () => void | unknown;
+  let scheduleUpdate: (() => void | unknown) | null = null;
+  
   const reaction: Schedule = {
-    schedule: () => scheduleUpdate,
-    dependencies: new Set<Set<Schedule>>(),
+    schedule: () => scheduleUpdate ?? (() => {}),
+    dependencies: new Set<DepSet>(),
   };
 
   function track<R>(fn: () => R): R {
@@ -82,17 +86,29 @@ export function createReaction() {
     context.push(reaction);
     try {
       return fn();
-    } // 🟢 优化：移除了冗余的 catch(e) { throw e }
-    finally {
+    } catch (e) {
+      // 🟢 优化：一旦用户传入的执行函数崩溃，立即彻底清理依赖，防止 Reaction 处于污染状态
+      cleanup(reaction);
+      throw e;
+    } finally {
       context.pop();
     }
   }
 
   function reconcile(fn: () => void | unknown) {
+    // 🟢 优化：防止防御性误操作或重复覆盖
     scheduleUpdate = fn;
   }
-  return { track, reconcile, reaction };
+
+  // 🟢 建议补充：显式的销毁方法，便于非 React 场景下手动安全卸载
+  function dispose() {
+    cleanup(reaction);
+    scheduleUpdate = null;
+  }
+
+  return { track, reconcile, reaction, dispose };
 }
+
 
 export function useReaction<T, S = T>(fn: Extract<T>, selector?: (state: T) => S): S {
   // 🟢 优化：默认 selector 使用固定引用，避免重渲染引发的判定问题
