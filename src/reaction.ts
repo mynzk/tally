@@ -1,14 +1,13 @@
 import { useState, useSyncExternalStore, useMemo, useRef } from "react";
-import { produce, Draft } from "immer"; // 🟢 优化：引入 Draft 类型
+import { produce, Draft } from "immer";
 import { createScheduler } from "./scheduler";
 
 // ==================== 1. 类型定义 ====================
-// 🟢 优化：重新定义更清晰的类型别名
-export type DepSet = Set<Schedule>; // 代表 Signal 内部的订阅者集合
+export type DepSet = Set<Schedule>;
 
 export interface Schedule {
   schedule: () => () => unknown | void;
-  dependencies: Set<DepSet>; // 收集自己订阅了哪些 Signal 的 DepSet
+  dependencies: Set<DepSet>;
 }
 
 export type SetValueType<S> = S | ((prevValue: S) => S);
@@ -25,11 +24,14 @@ let isBatching = false;
 const runTaskAsync = createScheduler("channel");
 
 function flushQueue() {
-  const queue = Array.from(batchQueue);
-  batchQueue.clear();
   isBatching = false;
-  for (const update of queue) {
-    update();
+  // ⚡ 优化：标准 while 队列消费，防止执行任务时向队列追加新任务导致遗漏
+  while (batchQueue.size > 0) {
+    const queue = Array.from(batchQueue);
+    batchQueue.clear();
+    for (const update of queue) {
+      update();
+    }
   }
 }
 
@@ -47,7 +49,8 @@ function cleanup(reaction: Schedule) {
 
 // ==================== 3. 核心 API 实现 ====================
 
-export function createSignal<T>(value: T): [Extract<T>, SetterOrUpdater<SetValueType<T>>] {
+export function createSignal<T>(initialValue: T): [Extract<T>, SetterOrUpdater<SetValueType<T>>] {
+  let value = initialValue; // 🟢 修正：这里原代码是直接改形参，闭包直接引用局部变量更稳固
   const subscriptions = new Set<Schedule>();
 
   const read = (): T => {
@@ -57,9 +60,15 @@ export function createSignal<T>(value: T): [Extract<T>, SetterOrUpdater<SetValue
   };
 
   const write = (nextValue: SetValueType<T>) => {
+    // ⚡ 优化：计算新值时短暂清空上下文，防止函数体内读 Signal 造成依赖污染
+    const tempContext = [...context];
+    context.length = 0;
     const newValue = isFn(nextValue) ? nextValue(value) : nextValue;
+    context.push(...tempContext);
+
     if (!Object.is(newValue, value)) {
       value = newValue;
+      // 变动时，同步将所有订阅者推入批处理队列
       for (const sub of Array.from(subscriptions)) {
         const updateFn = sub.schedule();
         if (updateFn) batchQueue.add(updateFn);
@@ -87,7 +96,6 @@ export function createReaction() {
     try {
       return fn();
     } catch (e) {
-      // 🟢 优化：一旦用户传入的执行函数崩溃，立即彻底清理依赖，防止 Reaction 处于污染状态
       cleanup(reaction);
       throw e;
     } finally {
@@ -96,11 +104,9 @@ export function createReaction() {
   }
 
   function reconcile(fn: () => void | unknown) {
-    // 🟢 优化：防止防御性误操作或重复覆盖
     scheduleUpdate = fn;
   }
 
-  // 🟢 建议补充：显式的销毁方法，便于非 React 场景下手动安全卸载
   function dispose() {
     cleanup(reaction);
     scheduleUpdate = null;
@@ -109,51 +115,54 @@ export function createReaction() {
   return { track, reconcile, reaction, dispose };
 }
 
-
 export function useReaction<T, S = T>(fn: Extract<T>, selector?: (state: T) => S): S {
-  // 🟢 优化：默认 selector 使用固定引用，避免重渲染引发的判定问题
   const defaultSelector = (state: T) => state as unknown as S;
   const activeSelector = selector || defaultSelector;
 
-  // 🟢 优化：使用 Ref 存储最新函数，解决 useMemo 依赖改变导致 Reaction 实例重建、依赖丢失的问题
   const latestFn = useRef(fn);
   const latestSelector = useRef(activeSelector);
   latestFn.current = fn;
   latestSelector.current = activeSelector;
 
-  // 🟢 优化：增加快照缓存，防止 selector 返回新对象时引发 useSyncExternalStore 渲染死循环
-  const lastSelectedState = useRef<S | null>(null);
-
-  const { subscribe, getState } = useMemo(() => {
-    let updateCallback: (() => void) | null = null;
+  // ⚡ 优化：核心缓存结构，严格遵守 useSyncExternalStore 规范
+  const storeMemo = useMemo(() => {
     const { track, reconcile, reaction } = createReaction();
+    
+    // 缓存上一次切片数据
+    let lastSelectedState: S;
+    let isInitialized = false;
 
-    reconcile(() => updateCallback?.());
+    const runTrack = () => {
+      return track(() => latestSelector.current(latestFn.current()));
+    };
 
     const subscribe = (cb: () => void) => {
-      updateCallback = cb;
+      // 当底层 Signal 通知改变时，触发 track 重新收集依赖，并运行 React 更新
+      reconcile(() => {
+        const nextState = runTrack();
+        if (!Object.is(lastSelectedState, nextState)) {
+          lastSelectedState = nextState;
+          cb(); // 真正通知 React 更新
+        }
+      });
       return () => {
-        updateCallback = null;
         cleanup(reaction);
       };
     };
 
     const getState = () => {
-      // 始终执行 track 以保证依赖是最新的
-      const nextState = track(() => latestSelector.current(latestFn.current()));
-      
-      // 浅比较：如果新旧状态全等，直接返回旧引用，避免 React 判定失误
-      if (Object.is(lastSelectedState.current, nextState)) {
-        return lastSelectedState.current as S;
+      // 初始化执行第一次依赖收集
+      if (!isInitialized) {
+        lastSelectedState = runTrack();
+        isInitialized = true;
       }
-      lastSelectedState.current = nextState;
-      return nextState;
+      return lastSelectedState;
     };
 
     return { subscribe, getState };
-  }, []); // 🟢 优化：空依赖数组，确保单个组件内生命周期内 Reaction 唯一
+  }, []);
 
-  return useSyncExternalStore(subscribe, getState, getState);
+  return useSyncExternalStore(storeMemo.subscribe, storeMemo.getState, storeMemo.getState);
 }
 
 export function useSignal<T>(initialValue: T): [Extract<T>, SetterOrUpdater<SetValueType<T>>] {
@@ -161,15 +170,11 @@ export function useSignal<T>(initialValue: T): [Extract<T>, SetterOrUpdater<SetV
   return signal;
 }
 
-/**
- * 🟢 满血版：整合 Immer 的 Store 创建器
- */
 export function create<T extends object>(initState: T) {
   const [state, setState] = createSignal<T>(initState);
 
   const useStore = <S = T>(selector?: (state: T) => S) => useReaction(state, selector);
 
-  // 🟢 优化：对齐 Immer 官方签名，完美支持 (draft => void) 和 (draft => T)
   const dispatch = (recipe: (draft: Draft<T>) => void | T) => {
     const oldState = state();
     const nextState = produce(oldState, recipe);
